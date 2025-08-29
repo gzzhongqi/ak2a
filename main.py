@@ -1177,10 +1177,11 @@ async def chat_completions(
 
                                 if should_process_reasoning and in_think_tag:
                                     # We are inside a think tag
-                                    if "</think>" in msg_data:
-                                        parts = msg_data.split("</think>", 1)
+                                    if "</think>\n\n" in msg_data:
+                                        parts = msg_data.split("</think>\n\n", 1)
                                         reasoning_part = parts[0]
                                         content_part = parts[1] if len(parts) > 1 else ""
+                                        print(parts)
                                         in_think_tag = False
 
                                         # Send remaining reasoning part
