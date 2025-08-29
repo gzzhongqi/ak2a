@@ -1317,8 +1317,8 @@ async def chat_completions(
                     # Extract reasoning content from the beginning
                     remaining = content_buffer[7:]  # Remove "<think>" prefix
                     
-                    if "</think>" in remaining:
-                        parts = remaining.split("</think>", 1)
+                    if "</think>\n\n" in remaining:
+                        parts = remaining.split("</think>\n\n", 1)
                         reasoning_buffer = parts[0]
                         final_content = parts[1] if len(parts) > 1 else ""
                     else:
