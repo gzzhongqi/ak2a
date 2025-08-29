@@ -1181,7 +1181,6 @@ async def chat_completions(
                                         parts = msg_data.split("</think>\n\n", 1)
                                         reasoning_part = parts[0]
                                         content_part = parts[1] if len(parts) > 1 else ""
-                                        print(parts)
                                         in_think_tag = False
 
                                         # Send remaining reasoning part
