@@ -1037,6 +1037,11 @@ async def chat_completions(
         is_streaming = data.get('stream', False)
         logger.info(f"Request mode: {'streaming' if is_streaming else 'non-streaming'}")
         
+        # Check if this is a DeepSeek model
+        model_name = data.get('model', "")
+        is_deepseek = "DeepSeek" in model_name
+        logger.info(f"Model: {model_name}, Is DeepSeek: {is_deepseek}")
+        
         # 获取随机浏览器指纹
         fingerprint = get_random_browser_fingerprint()
         logger.info(f"Using browser fingerprint: {fingerprint['user_agent']}")
@@ -1122,7 +1127,10 @@ async def chat_completions(
             if is_streaming:
                 # Streaming mode - return data as it comes
                 def generate():
-                    content_buffer = ""
+                    in_think_tag = False
+                    is_first_message = True
+                    should_process_reasoning = False
+                    
                     for line in response.iter_lines():
                         if not line:
                             continue
@@ -1159,20 +1167,63 @@ async def chat_completions(
                                             yield f"data: {json.dumps(message)}\n\n"
                                         continue
                                 
-                                content_buffer += msg_data
-                                
-                                chunk = {
-                                    "id": f"chatcmpl-{chat_id}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": data.get('model'),
-                                    "choices": [{
-                                        "delta": {"content": msg_data},
-                                        "index": 0,
-                                        "finish_reason": None
-                                    }]
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
+                                # Handle DeepSeek reasoning content only if it starts at the very beginning
+                                if is_deepseek and is_first_message:
+                                    if msg_data.startswith("<think>"):
+                                        should_process_reasoning = True
+                                        in_think_tag = True
+                                        msg_data = msg_data[7:]  # Remove "<think>"
+                                    is_first_message = False
+
+                                if should_process_reasoning and in_think_tag:
+                                    # We are inside a think tag
+                                    if "</think>" in msg_data:
+                                        parts = msg_data.split("</think>", 1)
+                                        reasoning_part = parts[0]
+                                        content_part = parts[1] if len(parts) > 1 else ""
+                                        in_think_tag = False
+
+                                        # Send remaining reasoning part
+                                        if reasoning_part:
+                                            chunk = {
+                                                "id": f"chatcmpl-{chat_id}",
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": data.get('model'),
+                                                "choices": [{"delta": {"reasoning_content": reasoning_part}, "index": 0, "finish_reason": None}]
+                                            }
+                                            yield f"data: {json.dumps(chunk)}\n\n"
+                                        
+                                        # Send content part if any
+                                        if content_part:
+                                            chunk = {
+                                                "id": f"chatcmpl-{chat_id}",
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": data.get('model'),
+                                                "choices": [{"delta": {"content": content_part}, "index": 0, "finish_reason": None}]
+                                            }
+                                            yield f"data: {json.dumps(chunk)}\n\n"
+                                    else:
+                                        # Still inside think tag, send as reasoning content
+                                        chunk = {
+                                            "id": f"chatcmpl-{chat_id}",
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": data.get('model'),
+                                            "choices": [{"delta": {"reasoning_content": msg_data}, "index": 0, "finish_reason": None}]
+                                        }
+                                        yield f"data: {json.dumps(chunk)}\n\n"
+                                else:
+                                    # Normal content processing
+                                    chunk = {
+                                        "id": f"chatcmpl-{chat_id}",
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": data.get('model'),
+                                        "choices": [{"delta": {"content": msg_data}, "index": 0, "finish_reason": None}]
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
                             
                             elif msg_type in ['e', 'd']:
                                 chunk = {
@@ -1206,6 +1257,7 @@ async def chat_completions(
             else:
                 # Non-streaming mode - collect all content and return at once
                 content_buffer = ""
+                reasoning_buffer = ""
                 finish_reason = None
                 
                 for line in response.iter_lines():
@@ -1260,6 +1312,31 @@ async def chat_completions(
                         print(f"Error processing line: {e}")
                         continue
                 
+                # Process content for DeepSeek models - only if it starts with <think>
+                if is_deepseek and content_buffer.startswith("<think>"):
+                    # Extract reasoning content from the beginning
+                    remaining = content_buffer[7:]  # Remove "<think>" prefix
+                    
+                    if "</think>" in remaining:
+                        parts = remaining.split("</think>", 1)
+                        reasoning_buffer = parts[0]
+                        final_content = parts[1] if len(parts) > 1 else ""
+                    else:
+                        # If </think> is missing, treat all as reasoning
+                        reasoning_buffer = remaining
+                        final_content = ""
+                else:
+                    final_content = content_buffer
+                
+                # Build response with reasoning_content if present
+                message_dict = {
+                    "role": "assistant",
+                    "content": final_content if not is_deepseek else final_content
+                }
+                
+                if is_deepseek and reasoning_buffer:
+                    message_dict["reasoning_content"] = reasoning_buffer
+                
                 # Return complete response in OpenAI format
                 complete_response = {
                     "id": f"chatcmpl-{chat_id}",
@@ -1267,10 +1344,7 @@ async def chat_completions(
                     "created": int(time.time()),
                     "model": data.get('model'),
                     "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": content_buffer
-                        },
+                        "message": message_dict,
                         "index": 0,
                         "finish_reason": finish_reason or "stop"
                     }],
@@ -1368,17 +1442,17 @@ async def list_models(
                 logger.error(f"Unexpected response format: {type(akash_response)}")
                 models_list = []
             
-            # 转换为标准 OpenAI 格式
+            # 转换为标准 OpenAI 格式，并只包含 "available": true 的模型
             openai_models = {
                 "object": "list",
                 "data": [
                     {
-                        "id": model["id"] if isinstance(model, dict) else model,
+                        "id": model["id"],
                         "object": "model",
                         "created": int(time.time()),
                         "owned_by": "akash",
                         "permission": [{
-                            "id": f"modelperm-{model['id'] if isinstance(model, dict) else model}",
+                            "id": f"modelperm-{model['id']}",
                             "object": "model_permission",
                             "created": int(time.time()),
                             "allow_create_engine": False,
@@ -1391,7 +1465,7 @@ async def list_models(
                             "group": None,
                             "is_blocking": False
                         }]
-                    } for model in models_list
+                    } for model in models_list if isinstance(model, dict) and model.get("available") is True
                 ]
             }
             
