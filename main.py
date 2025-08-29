@@ -1033,6 +1033,10 @@ async def chat_completions(
     try:
         data = await request.json()
         
+        # Check if streaming is requested (default to False for non-streaming)
+        is_streaming = data.get('stream', False)
+        logger.info(f"Request mode: {'streaming' if is_streaming else 'non-streaming'}")
+        
         # 获取随机浏览器指纹
         fingerprint = get_random_browser_fingerprint()
         logger.info(f"Using browser fingerprint: {fingerprint['user_agent']}")
@@ -1114,8 +1118,96 @@ async def chat_completions(
                     detail=f"Akash API error: {response.text}"
                 )
             
-            def generate():
+            # Process streaming response based on request mode
+            if is_streaming:
+                # Streaming mode - return data as it comes
+                def generate():
+                    content_buffer = ""
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                            
+                        try:
+                            line_str = line.decode('utf-8')
+                            msg_type, msg_data = line_str.split(':', 1)
+                            
+                            if msg_type == '0':
+                                if msg_data.startswith('"') and msg_data.endswith('"'):
+                                    msg_data = msg_data.replace('\\"', '"')
+                                    msg_data = msg_data[1:-1]
+                                msg_data = msg_data.replace("\\n", "\n")
+                                
+                                # 在处理消息时先判断模型类型
+                                if data.get('model') == 'AkashGen' and "<image_generation>" in msg_data:
+                                    # 图片生成模型的特殊处理
+                                    async def process_and_send():
+                                        messages = await process_image_generation(msg_data, session, fingerprint["headers"], chat_id)
+                                        if messages:
+                                            return messages
+                                        return None
+
+                                    # 创建新的事件循环
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        result_messages = loop.run_until_complete(process_and_send())
+                                    finally:
+                                        loop.close()
+                                    
+                                    if result_messages:
+                                        for message in result_messages:
+                                            yield f"data: {json.dumps(message)}\n\n"
+                                        continue
+                                
+                                content_buffer += msg_data
+                                
+                                chunk = {
+                                    "id": f"chatcmpl-{chat_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": data.get('model'),
+                                    "choices": [{
+                                        "delta": {"content": msg_data},
+                                        "index": 0,
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            
+                            elif msg_type in ['e', 'd']:
+                                chunk = {
+                                    "id": f"chatcmpl-{chat_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": data.get('model'),
+                                    "choices": [{
+                                        "delta": {},
+                                        "index": 0,
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                break
+                                
+                        except Exception as e:
+                            print(f"Error processing line: {e}")
+                            continue
+
+                return StreamingResponse(
+                    generate(),
+                    media_type='text/event-stream',
+                    headers={
+                        'Cache-Control': 'no-cache',
+                        'Connection': 'keep-alive',
+                        'Content-Type': 'text/event-stream'
+                    }
+                )
+            else:
+                # Non-streaming mode - collect all content and return at once
                 content_buffer = ""
+                finish_reason = None
+                
                 for line in response.iter_lines():
                     if not line:
                         continue
@@ -1136,66 +1228,60 @@ async def chat_completions(
                                 async def process_and_send():
                                     messages = await process_image_generation(msg_data, session, fingerprint["headers"], chat_id)
                                     if messages:
-                                        return messages
+                                        # Collect all content from messages
+                                        combined_content = ""
+                                        for message in messages:
+                                            if 'choices' in message and len(message['choices']) > 0:
+                                                delta = message['choices'][0].get('delta', {})
+                                                if 'content' in delta:
+                                                    combined_content += delta['content']
+                                        return combined_content
                                     return None
 
                                 # 创建新的事件循环
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
                                 try:
-                                    result_messages = loop.run_until_complete(process_and_send())
+                                    result_content = loop.run_until_complete(process_and_send())
                                 finally:
                                     loop.close()
                                 
-                                if result_messages:
-                                    for message in result_messages:
-                                        yield f"data: {json.dumps(message)}\n\n"
-                                    continue
+                                if result_content:
+                                    content_buffer += result_content
+                                continue
                             
                             content_buffer += msg_data
-                            
-                            chunk = {
-                                "id": f"chatcmpl-{chat_id}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": data.get('model'),
-                                "choices": [{
-                                    "delta": {"content": msg_data},
-                                    "index": 0,
-                                    "finish_reason": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
                         
                         elif msg_type in ['e', 'd']:
-                            chunk = {
-                                "id": f"chatcmpl-{chat_id}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": data.get('model'),
-                                "choices": [{
-                                    "delta": {},
-                                    "index": 0,
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                            yield "data: [DONE]\n\n"
+                            finish_reason = "stop"
                             break
                             
                     except Exception as e:
                         print(f"Error processing line: {e}")
                         continue
-
-            return StreamingResponse(
-                generate(),
-                media_type='text/event-stream',
-                headers={
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive',
-                    'Content-Type': 'text/event-stream'
+                
+                # Return complete response in OpenAI format
+                complete_response = {
+                    "id": f"chatcmpl-{chat_id}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": data.get('model'),
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": content_buffer
+                        },
+                        "index": 0,
+                        "finish_reason": finish_reason or "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,  # We don't have actual token counts from Akash
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
                 }
-            )
+                
+                return complete_response
     
     except Exception as e:
         print(f"Error in chat_completions: {e}")
